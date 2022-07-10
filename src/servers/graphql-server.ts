@@ -20,17 +20,15 @@ import {
 import { ApolloError, ApolloServer } from "apollo-server-express"
 import express from "express"
 import { expressjwt } from "express-jwt"
-import { execute, GraphQLError, subscribe } from "graphql"
+import { GraphQLError } from "graphql"
 import { rule } from "graphql-shield"
 import helmet from "helmet"
 import * as jwt from "jsonwebtoken"
 import pino from "pino"
 import PinoHttp from "pino-http"
-import {
-  ExecuteFunction,
-  SubscribeFunction,
-  SubscriptionServer,
-} from "subscriptions-transport-ws"
+// import Extra, { WebSocketServer } from "ws"
+import { WebSocketServer } from "ws"
+import { useServer } from "graphql-ws/lib/use/ws"
 
 import { mapError } from "@graphql/error-map"
 
@@ -57,10 +55,46 @@ export const isEditor = rule({ cache: "contextual" })(
   },
 )
 
+const GRAPHQL_PATH = "/graphql"
+
 const jwtAlgorithms: jwt.Algorithm[] = ["HS256"]
 
 const geeTestConfig = getGeetestConfig()
 const geetest = Geetest(geeTestConfig)
+
+const isValidContextWS = (
+  ctx,
+  // Context<
+  //   Record<string, unknown> | undefined,
+  //   Extra & Partial<Record<PropertyKey, never>>
+  // >,
+) => {
+  const connectionParams = ctx.connectionParams
+
+  if (connectionParams) {
+    let tokenPayload: string | jwt.JwtPayload | null = null
+    const authz =
+      (connectionParams.authorization as string) ||
+      (connectionParams.Authorization as string)
+    if (authz) {
+      const rawToken = authz.slice(7)
+      tokenPayload = jwt.verify(rawToken, JWT_SECRET, {
+        algorithms: jwtAlgorithms,
+      })
+      if (typeof tokenPayload === "string") {
+        throw new Error("tokenPayload should be an object")
+      }
+    }
+    return sessionContext({
+      tokenPayload,
+
+      // FIXME: this will not work. remoteAddress will not be included
+      ip: ctx?.extra.socket?.remoteAddress,
+      // TODO: Resolve what's needed here
+      body: null,
+    })
+  }
+}
 
 const sessionContext = ({
   tokenPayload,
@@ -123,7 +157,7 @@ export const startApolloServer = async ({
   const app = express()
   const httpServer = createServer(app)
 
-  const apolloPulgins = [
+  const apolloPlugins = [
     ApolloServerPluginDrainHttpServer({ httpServer }),
     apolloConfig.playground
       ? ApolloServerPluginLandingPageGraphQLPlayground({
@@ -139,7 +173,7 @@ export const startApolloServer = async ({
   ]
 
   if (isProd && enableApolloUsageReporting) {
-    apolloPulgins.push(
+    apolloPlugins.push(
       ApolloServerPluginUsageReporting({
         rewriteError(err) {
           graphqlLogger.error(err, "Error caught in rewriteError")
@@ -149,10 +183,40 @@ export const startApolloServer = async ({
     )
   }
 
+  if (startSubscriptionServer) {
+    const wsServer = new WebSocketServer({
+      server: httpServer,
+      path: GRAPHQL_PATH,
+    })
+
+    const serverCleanup = useServer(
+      {
+        schema,
+        onConnect: isValidContextWS,
+        context: isValidContextWS,
+      },
+      wsServer,
+    )
+
+    ;["SIGINT", "SIGTERM"].forEach((signal) => {
+      process.on(signal, () => wsServer.close())
+    })
+
+    apolloPlugins.push({
+      async serverWillStart() {
+        return {
+          async drainServer() {
+            await serverCleanup.dispose()
+          },
+        }
+      },
+    })
+  }
+
   const apolloServer = new ApolloServer({
     schema,
     introspection: apolloConfig.playground,
-    plugins: apolloPulgins,
+    plugins: apolloPlugins,
     context: async (context) => {
       // @ts-expect-error: TODO
       const tokenPayload = context.req?.token ?? null
@@ -254,52 +318,10 @@ export const startApolloServer = async ({
 
   await apolloServer.start()
 
-  apolloServer.applyMiddleware({ app, path: "/graphql" })
+  apolloServer.applyMiddleware({ app, path: GRAPHQL_PATH })
 
   return new Promise((resolve, reject) => {
     httpServer.listen({ port }, () => {
-      if (startSubscriptionServer) {
-        const apolloSubscriptionServer = new SubscriptionServer(
-          {
-            execute: execute as unknown as ExecuteFunction,
-            subscribe: subscribe as unknown as SubscribeFunction,
-            schema,
-            async onConnect(connectionParams, webSocket, connectionContext) {
-              const { request } = connectionContext
-
-              let tokenPayload: string | jwt.JwtPayload | null = null
-              const authz =
-                connectionParams.authorization || connectionParams.Authorization
-              if (authz) {
-                const rawToken = authz.slice(7)
-                tokenPayload = jwt.verify(rawToken, JWT_SECRET, {
-                  algorithms: jwtAlgorithms,
-                })
-
-                if (typeof tokenPayload === "string") {
-                  throw new Error("tokenPayload should be an object")
-                }
-              }
-
-              return sessionContext({
-                tokenPayload,
-                ip: request?.socket?.remoteAddress,
-
-                // TODO: Resolve what's needed here
-                body: null,
-              })
-            },
-          },
-          {
-            server: httpServer,
-            path: apolloServer.graphqlPath,
-          },
-        )
-        ;["SIGINT", "SIGTERM"].forEach((signal) => {
-          process.on(signal, () => apolloSubscriptionServer.close())
-        })
-      }
-
       console.log(
         `🚀 Server ready at http://localhost:${port}${apolloServer.graphqlPath}`,
       )
