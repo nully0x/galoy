@@ -380,4 +380,7 @@ type ImbalanceCalculator = {
   getSwapOutImbalance: (
     walletId: WalletId,
   ) => Promise<SwapOutImbalance | LedgerServiceError>
+  getSwapOutImbalanceAmount: (
+    walletId: WalletId,
+  ) => Promise<BtcPaymentAmount | LedgerServiceError | ValidationError>
 }
