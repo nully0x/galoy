@@ -155,7 +155,9 @@ export const getFeesConfig = (feesConfig = yamlConfig.fees): FeesConfig => {
   const withdrawRatio =
     method === WithdrawalFeePriceMethod.flat ? 0 : feesConfig.withdraw.ratio
   const withdrawRatioAsBasisPoints =
-    method === WithdrawalFeePriceMethod.flat ? 0n : feesConfig.withdraw.ratio
+    method === WithdrawalFeePriceMethod.flat
+      ? 0n
+      : BigInt(feesConfig.withdraw.ratioAsBasisPoints)
 
   return {
     depositFeeVariable: feesConfig.deposit,
